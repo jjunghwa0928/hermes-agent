@@ -557,6 +557,7 @@ import { createCheckoutStrategy } from './updater/checkout'
 import { readSourceUpdate, type SourceUpdate } from './updater/checkout-source'
 import { ExternalStrategy } from './updater/external'
 import { readUpdatesFeedBaseFromConfig, resolveFeedBaseUrl } from './updater/feed-config'
+import { readConfiguredUpdateProxy, resolveUpdateProxy, proxyRulesFor, proxyFetchFactory } from './update-transport-proxy'
 import { createChannelMacStrategy, createMacStrategy } from './updater/mac-client'
 import { UpdateOperation } from './updater/operation'
 import {
@@ -3317,7 +3318,49 @@ function emitUpdateProgress(payload) {
   }
 }
 
+/**
+ * The one proxy answer for update traffic (#60049): `updates.proxy` from
+ * config.yaml, else the ambient env a proxied shell exported. Resolved once
+ * per update flow and applied to every transport — the fetch the channel
+ * resolver uses, electron-updater's network session, and the env inherited by
+ * the source-check and hand-off children. Never throws: an unreadable config
+ * or malformed value means "no configured proxy", and ambient env still
+ * applies.
+ */
+let lastResolvedUpdateProxy: string | null = null
+
+async function applyUpdateProxy(): Promise<void> {
+  const configured = await readConfiguredUpdateProxy(path.join(HERMES_HOME, 'config.yaml'))
+  const { proxy } = resolveUpdateProxy(process.env, configured ? { updates: { proxy: configured } } : null)
+  lastResolvedUpdateProxy = proxy
+
+  if (!proxy || !IS_MAC) {
+    return
+  }
+
+  // electron-updater dials through the shared "electron-updater" session; a
+  // dedicated rules string keeps every other session (and the app's own
+  // traffic) untouched. Only the macOS electron-updater arm reads it — the
+  // Windows/checkout arms carry the proxy via the child env instead.
+  const rules = proxyRulesFor(proxy)
+
+  if (!rules) {
+    return
+  }
+
+  try {
+    const { NET_SESSION_NAME } = await import('electron-updater/out/electronHttpExecutor') as { NET_SESSION_NAME: string }
+    const session = (await import('electron')).session.fromPartition(NET_SESSION_NAME, { cache: false })
+    await session.setProxy({ proxyRules: rules })
+    rememberLog(`[updates] using proxy ${proxy} from updates.proxy/env for update traffic`)
+  } catch (error) {
+    rememberLog(`[updates] could not apply update proxy: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 async function checkUpdates(opts: { force?: boolean } = {}): Promise<UpdaterStatusWire> {
+  await applyUpdateProxy()
+
   // A packaged install delegates to the update owner named by its stamp.
   let strategy: UpdaterStrategy | null = null
 
@@ -3388,12 +3431,16 @@ async function createPackagedUpdateStrategy(): Promise<UpdaterStrategy | null> {
     return new ChannelStrategy({
       build,
       mechanism,
-      resolver: new ChannelResolver({
-        build,
-        platform: process.platform,
-        arch: process.arch,
-        signer: installed.signer
-      }),
+      resolver: ChannelResolver.withProxy(
+        {
+          build,
+          platform: process.platform,
+          arch: process.arch,
+          signer: installed.signer,
+          proxyUrl: lastResolvedUpdateProxy ?? undefined
+        },
+        proxyFetchFactory()
+      ),
       nativeFactory: (target: ChannelTarget): UpdaterStrategy => createNativePackagedStrategy(mechanism, target)
     })
   }
@@ -3526,6 +3573,7 @@ function requireBundledPayload(mechanism: UpdaterStrategy['mechanism']): Payload
 function resolveCheckoutUpdateStrategy(): UpdaterStrategy {
   return createCheckoutStrategy({
     hermesHome: HERMES_HOME,
+    proxyEnv: lastResolvedUpdateProxy ? resolveUpdateProxy(process.env, { updates: { proxy: lastResolvedUpdateProxy } }).env : {},
     isWindows: IS_WINDOWS,
     isMac: IS_MAC,
     defaultUpdateBranch: DEFAULT_UPDATE_BRANCH,
