@@ -16,17 +16,35 @@ import { runBackendStartStep } from './backend-start-cancellation'
  *    `applyUpdates()` critical section, and
  *  - the successful detached hand-off state, which remains true while this
  *    Desktop is waiting to quit after the wrapper has handed control away.
+ *  - the host fleet-restart obligation record, armed by EXTERNAL updates
+ *    (any profile's CLI, a maintenance script, the gateway's own /update)
+ *    before they bounce the gateway fleet and discharged only when
+ *    post-restart verification proves the fleet is on the pulled code
+ *    (#126177).
  *
- * The marker alone is NOT enough (#73822): `applyUpdates` stops its backend
+ * The marker alone is NOT enough (#73822): `applyUpdates` stops its own backend
  * early (`releaseBackendLock`) before committing the hand-off. The renderer
  * reconnects after the WebSocket closes; a marker-only gate can spawn a new
  * backend on the runtime being replaced. Consulting the flag closes that
  * window. On success the marker is written BEFORE the flag clears in `applyUpdates`'
  * `finally`, so there is no instant where both signals are false and a
  * waiter could slip through mid-update.
+ *
+ * The host obligation record closes the external-update window the other
+ * three cannot see (#126177): the updater releases the live-update marker
+ * before its fleet-restart tail, and an update driven from outside this
+ * process never sets `updateInFlight`. In that gap a Desktop backend respawn
+ * raced the bouncing gateway and aborted with "Hermes Desktop is quitting."
+ * The record is cross-process by construction — it lives in the host
+ * gateway-locks state dir, not this app's memory or this profile's home.
  */
 
-export type UpdateGateReason = 'marker' | 'update-in-flight' | 'handoff' | null
+export type UpdateGateReason =
+  | 'marker'
+  | 'update-in-flight'
+  | 'handoff'
+  | 'fleet-restart-pending'
+  | null
 
 export interface UpdateGateDeps {
   /** True when a live on-disk update marker exists (see update-marker.ts). */
@@ -35,6 +53,8 @@ export interface UpdateGateDeps {
   isUpdateInFlight: () => boolean
   /** True after a detached updater hand-off is viable and this Desktop will quit. */
   isHandoffActive: () => boolean
+  /** True when the host still owes the fleet a restart onto freshly pulled code (#126177). */
+  hasFleetRestartPending: () => boolean
 }
 
 /** Why the gate is closed right now, or null when it is open. */
@@ -49,6 +69,10 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
 
   if (deps.isHandoffActive()) {
     return 'handoff'
+  }
+
+  if (deps.hasFleetRestartPending()) {
+    return 'fleet-restart-pending'
   }
 
   return null

@@ -301,6 +301,7 @@ import {
 } from './host-backend-attach'
 import { assertNoSecondLocalBackend, assertNotPassiveSpawn } from './host-backend-singleton'
 import { lookupPublishedSessionToken } from './host-published-token'
+import { hostFleetRestartPending, type HostRendezvousEnv } from './update-gate-host-obligation'
 import { requestHudClose } from './hud-close'
 import { cursorPointInWindow } from './hud-cursor'
 import { startHudGameOverlayWatch } from './hud-game-overlay'
@@ -2607,11 +2608,25 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 // The hand-off state closes the later Windows `cmd start` wrapper gap: the
 // wrapper exits 0 before the real PowerShell script claims the marker, and
 // `finally` clears updateInFlight immediately after the hand-off is accepted.
+// The fleet-restart obligation record closes the EXTERNAL-update gap (#126177):
+// an update driven from outside this process (another profile's CLI, a
+// maintenance script, the gateway's own /update) releases its live-update
+// marker before bouncing the gateway fleet, so the marker/flag/hand-off trio
+// is all false while the fleet restart is still in flight. The host record is
+// armed before the pull and discharged only after fleet verification, making
+// it the one cross-process signal that spans the restart tail.
 function updateGateDeps() {
   return {
     hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
     isUpdateInFlight: () => updateInFlight,
-    isHandoffActive: () => isQuittingForHandoff
+    isHandoffActive: () => isQuittingForHandoff,
+    hasFleetRestartPending: () =>
+      hostFleetRestartPending({
+        home: os.homedir(),
+        lockDir: process.env.HERMES_GATEWAY_LOCK_DIR,
+        platform: process.platform,
+        stateHome: process.env.XDG_STATE_HOME
+      } satisfies HostRendezvousEnv)
   }
 }
 
