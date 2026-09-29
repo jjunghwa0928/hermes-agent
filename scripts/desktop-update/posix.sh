@@ -825,7 +825,9 @@ export PYTHONUNBUFFERED=1
 # the result carries the skew repair message. Dev/checkout runs (target
 # inside INSTALL_ROOT, e.g. a node_modules electron) keep today's flow — the
 # post-update skew warning still applies to them.
-# ponytail: path-prefix heuristic; per-manager repair commands if it misfires.
+# Heuristic: relaunch targets outside INSTALL_ROOT are treated as packaged
+# shells; if that misfires for a layout we don't know, the user gets the
+# per-manager repair instructions below instead of a broken backend pair.
 if [ "$(uname)" != "Darwin" ] && [ -n "$RELAUNCH_TARGET" ]; then
   linux_gate
   if [ "$GATE" = "skew" ]; then
@@ -834,7 +836,7 @@ if [ "$(uname)" != "Darwin" ] && [ -n "$RELAUNCH_TARGET" ]; then
       *)
         log "packaged shell ($RELAUNCH_TARGET): refusing backend update, keeping the compatible backend"
         FINAL_CODE=0
-        DONE_NOTE="The desktop app package (AppImage/deb/rpm) was not changed and cannot be updated by this flow. Nothing was changed: the compatible backend is still live. Update the hermes-desktop system package first, then re-run the update."
+        DONE_NOTE="The desktop app package (AppImage/deb/rpm) was not changed and cannot be updated by this flow. Nothing was changed: the compatible backend is still live. Update the desktop package first (apt upgrade hermes-desktop / dnf upgrade hermes-desktop / replace the AppImage), then re-run the update."
         ;;
     esac
   fi

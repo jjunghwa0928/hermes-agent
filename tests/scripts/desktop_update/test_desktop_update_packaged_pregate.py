@@ -65,6 +65,7 @@ def test_packaged_shell_refuses_before_touching_backend(tmp_path):
     assert result["ok"] is True and result["manual"] is True
     assert "was not changed" in result["message"]
     assert "Nothing was changed" in result["message"]
+    assert "apt upgrade hermes-desktop" in result["message"], "per-manager repair hint"
 
 
 def test_checkout_run_still_updates(tmp_path):
