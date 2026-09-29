@@ -843,6 +843,19 @@ def drift(*, include_venv: bool = True) -> dict[str, str]:
                 problems["venv"] = "out of sync with uv.lock"
         except (OSError, RuntimeError, ValueError) as exc:
             problems["venv"] = str(exc)
+        # Interpreter-version drift (#85356): a venv built with a different Python
+        # minor than PM's pinned one imports pure-Python modules fine and then dies
+        # on the first C extension (`import _ssl` → os error 32) — a wrong-Python
+        # venv must read as a wrong-Python venv, not a mystery install error.
+        from pm.environments import pinned_python_version, selected_venv, venv_python_version
+
+        pinned = pinned_python_version(paths.repo_root())
+        actual = venv_python_version(selected_venv(paths.repo_root()))
+        if pinned is not None and actual is not None and pinned != actual:
+            problems["venv"] = (
+                f"built for Python {actual[0]}.{actual[1]} but this install pins "
+                f"Python {pinned[0]}.{pinned[1]} — rebuild it: hermes pm install"
+            )
     return problems
 
 
