@@ -143,3 +143,107 @@ class TestUnifiedHeaders:
         assert both.requests_min.limit == classic_only.requests_min.limit
         assert both.requests_min.reset_seconds == classic_only.requests_min.reset_seconds
         assert set(both.unified) == {"overall", "5h", "7d"}
+
+
+# Subscription responses as received (two Pro/Max OAuth accounts, 2026-11-04 20:48:55Z): no
+# ``-limit``/``-remaining`` at all — usage arrives only as ``-utilization``, a fraction — and
+# overage switched off at org level reports ``rejected`` on the healthy account as well.
+_PROBED_AT = 1793825335.0  # 2026-11-04 20:48:55Z
+
+_SUBSCRIPTION_HEALTHY = {  # HTTP 200
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-reset": "1793841000",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.1",
+    "anthropic-ratelimit-unified-5h-reset": "1793841000",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.51",
+    "anthropic-ratelimit-unified-7d-reset": "1794297600",
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+}
+
+_SUBSCRIPTION_WEEK_SPENT = {  # HTTP 429
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-reset": "1794164400",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.0",
+    "anthropic-ratelimit-unified-5h-reset": "1793842800",
+    "anthropic-ratelimit-unified-7d-status": "rejected",
+    "anthropic-ratelimit-unified-7d-utilization": "1.0",
+    "anthropic-ratelimit-unified-7d-surpassed-threshold": "1.0",
+    "anthropic-ratelimit-unified-7d-reset": "1794164400",
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    "anthropic-ratelimit-unified-upgrade-paths": "upgrade_plan,overage",
+}
+
+
+def _subscription_state(headers, **overrides):
+    state = parse_rate_limit_headers({**headers, **overrides}, provider="anthropic")
+    assert state is not None
+    return state
+
+
+@pytest.fixture
+def at_probe_time(monkeypatch):
+    monkeypatch.setattr("agent.rate_limit_tracker.time.time", lambda: _PROBED_AT)
+
+
+class TestUnifiedUtilization:
+    def test_utilization_only_windows_report_usage(self, at_probe_time):
+        """With no counters sent, the window's usage is the utilization fraction Anthropic sent."""
+        state = _subscription_state(_SUBSCRIPTION_HEALTHY)
+        week = state.unified["7d"]
+        assert (week.limit, week.remaining) == (0, 0)
+        sent = float(_SUBSCRIPTION_HEALTHY["anthropic-ratelimit-unified-7d-utilization"])
+        assert week.usage_pct == pytest.approx(sent * 100)
+        assert week.remaining_seconds_now == pytest.approx(
+            float(_SUBSCRIPTION_HEALTHY["anthropic-ratelimit-unified-7d-reset"]) - _PROBED_AT
+        )
+        # Header family members that are not windows stay out (claim, threshold, fallback).
+        assert set(state.unified) == {"overall", "5h", "7d", "overage"}
+
+        display = format_rate_limit_display(state)
+        week_line = next(line for line in display.splitlines() if "Weekly/7d" in line)
+        assert f"{week.usage_pct:.1f}%" in week_line
+        assert "no limit reported" not in week_line
+        assert f"Weekly/7d: {week.usage_pct:.0f}% used" in format_rate_limit_compact(state)
+
+    def test_zero_and_over_one_utilization_are_readings_not_absence(self, at_probe_time):
+        spent = _subscription_state(_SUBSCRIPTION_WEEK_SPENT)
+        session_line = next(
+            line for line in format_rate_limit_display(spent).splitlines() if "Session/5h" in line
+        )
+        assert "0.0%" in session_line
+        # A spent window can read past 1.0; the percentage follows it rather than capping.
+        over = _subscription_state(
+            _SUBSCRIPTION_WEEK_SPENT, **{"anthropic-ratelimit-unified-5h-utilization": "1.01"}
+        )
+        assert over.unified["5h"].usage_pct == pytest.approx(101.0)
+        # No utilization header at all is still "not reported".
+        assert spent.unified["overall"].utilization is None
+
+    def test_disabled_overage_is_not_shown_as_a_rejection(self, at_probe_time):
+        """``overage-status: rejected`` with a disabled reason is a switched-off feature: the
+        healthy account must not show a rejection, while a real rejection (spent week) still does."""
+        for headers in (_SUBSCRIPTION_HEALTHY, _SUBSCRIPTION_WEEK_SPENT):
+            state = _subscription_state(headers)
+            reason = headers["anthropic-ratelimit-unified-overage-disabled-reason"]
+            display = format_rate_limit_display(state)
+            overage_line = next(line for line in display.splitlines() if "overage" in line)
+            assert "[rejected]" not in overage_line
+            assert reason in overage_line
+            assert "overage" not in format_rate_limit_compact(state)
+            # The status is still recorded as sent; only its display changes.
+            assert state.unified["overage"].status == headers["anthropic-ratelimit-unified-overage-status"]
+
+        healthy = _subscription_state(_SUBSCRIPTION_HEALTHY)
+        assert "[rejected]" not in format_rate_limit_display(healthy)
+        spent = _subscription_state(_SUBSCRIPTION_WEEK_SPENT)
+        week_line = next(line for line in format_rate_limit_display(spent).splitlines() if "Weekly/7d" in line)
+        assert "[rejected]" in week_line

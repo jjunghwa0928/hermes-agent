@@ -4,11 +4,12 @@ Two header families feed one ``RateLimitState``:
 
 - ``x-ratelimit-{limit,remaining,reset}-{requests,tokens}[-1h]`` (Nous Portal format, also
   used by OpenRouter / OpenAI-compatible APIs). Reset values are a seconds OFFSET.
-- ``anthropic-ratelimit-unified-[<window>-]{limit,remaining,reset,status}``, which Anthropic
-  sends instead on Claude Pro/Max subscription (OAuth) responses. Reset values are an
-  ABSOLUTE instant (ISO-8601 or unix epoch), and the subscription windows are anchored to
-  the session's first request rather than to a fixed clock grid — so the instant is stored
-  as sent and never floored into a bucket.
+- ``anthropic-ratelimit-unified-[<window>-]{limit,remaining,utilization,reset,status}``, which
+  Anthropic sends instead on Claude Pro/Max subscription (OAuth) responses. Usage can arrive
+  only as ``-utilization`` (a fraction of the window: 0.51 = 51%), with no ``-limit`` or
+  ``-remaining`` at all. Reset values are an ABSOLUTE instant (ISO-8601 or unix epoch), and
+  the subscription windows are anchored to the session's first request rather than to a fixed
+  clock grid — so the instant is stored as sent and never floored into a bucket.
 
 Parsing and display only: nothing here decides when a request is sent.
 """
@@ -28,7 +29,9 @@ _BUCKET_TAGS = (
 )
 
 _UNIFIED_PREFIX = "anthropic-ratelimit-unified-"
-_UNIFIED_FIELDS = frozenset({"limit", "remaining", "reset", "status"})
+# Matched as whole suffixes rather than split at the last "-": ``disabled-reason`` has a hyphen of
+# its own, so ``overage-disabled-reason`` belongs to the ``overage`` window.
+_UNIFIED_FIELDS = ("limit", "remaining", "utilization", "reset", "status", "disabled-reason")
 # The window-less form (``anthropic-ratelimit-unified-status``) is the account-wide verdict.
 _UNIFIED_OVERALL = "overall"
 
@@ -47,6 +50,12 @@ class RateLimitBucket:
     # Provider's own verdict for this window, when it sends one (Anthropic: allowed /
     # allowed_warning / rejected). Opaque here — recorded, never interpreted.
     status: str = ""
+    # Fraction of the window used (Anthropic ``-utilization``: 0.51 = 51%, can exceed 1.0). None
+    # means "not reported"; 0.0 is a real reading.
+    utilization: Optional[float] = None
+    # Why the provider has this window switched off (Anthropic ``overage-disabled-reason``, e.g.
+    # ``org_level_disabled``). Its status then says ``rejected`` on every response, healthy or not.
+    disabled_reason: str = ""
 
     @property
     def used(self) -> int:
@@ -54,7 +63,9 @@ class RateLimitBucket:
 
     @property
     def usage_pct(self) -> float:
-        return (self.used / self.limit) * 100.0 if self.limit > 0 else 0.0
+        if self.limit > 0:
+            return (self.used / self.limit) * 100.0
+        return self.utilization * 100.0 if self.utilization is not None else 0.0
 
     @property
     def remaining_seconds_now(self) -> float:
@@ -135,28 +146,42 @@ def _reset_instant(value: Any) -> float:
     return _parse_absolute_timestamp(value) or 0.0
 
 
+def _split_unified_name(rest: str) -> Optional[tuple[str, str]]:
+    """``"<window>-<field>"`` or ``"<field>"`` → (window, field); None for non-window members."""
+    for field_name in _UNIFIED_FIELDS:
+        if rest == field_name:
+            return _UNIFIED_OVERALL, field_name
+        if rest.endswith("-" + field_name):
+            return rest[: -len(field_name) - 1] or _UNIFIED_OVERALL, field_name
+    return None
+
+
 def parse_unified_rate_limit_buckets(lowered: Mapping[str, str]) -> dict[str, RateLimitBucket]:
     """``anthropic-ratelimit-unified-[<window>-]<field>`` headers → one bucket per window.
 
-    Windows are discovered from the headers themselves ("5h", "7d", "7d-opus", and the
-    window-less account-wide form) rather than enumerated, so a window Anthropic adds later
+    Windows are discovered from the headers themselves ("5h", "7d", "7d-opus", "overage", and
+    the window-less account-wide form) rather than enumerated, so a window Anthropic adds later
     is captured without a code change. Non-window members of the family
-    (``-fallback-percentage``) have no recognised field suffix and are skipped.
+    (``-fallback-percentage``, ``-representative-claim``, ``-7d-surpassed-threshold``) have no
+    recognised field suffix and are skipped.
     """
     now = time.time()
     by_window: dict[str, dict[str, str]] = {}
     for name, value in lowered.items():
         if not name.startswith(_UNIFIED_PREFIX):
             continue
-        window, _, field_name = name[len(_UNIFIED_PREFIX):].rpartition("-")
-        if field_name in _UNIFIED_FIELDS:
-            by_window.setdefault(window or _UNIFIED_OVERALL, {})[field_name] = value
+        split = _split_unified_name(name[len(_UNIFIED_PREFIX):])
+        if split:
+            window, field_name = split
+            by_window.setdefault(window, {})[field_name] = value
     return {
         window: RateLimitBucket(
             limit=_safe_int(values.get("limit")),
             remaining=_safe_int(values.get("remaining")),
             reset_at=_reset_instant(values.get("reset")),
             status=(values.get("status") or "").strip(),
+            utilization=_safe_float(values.get("utilization"), default=None),
+            disabled_reason=(values.get("disabled-reason") or "").strip(),
             captured_at=now,
         )
         for window, values in by_window.items()
@@ -244,12 +269,26 @@ def _sorted_unified(state: RateLimitState) -> list[tuple[str, RateLimitBucket]]:
 def _unified_line(window: str, bucket: RateLimitBucket, label_width: int = 14) -> str:
     """Format one unified window; windows that report only a status still get a line."""
     label = _unified_label(window)
+    if bucket.disabled_reason:
+        # Its ``rejected`` status is the switch being off, not a limit being hit.
+        return f"  {label:<{label_width}}  (disabled: {bucket.disabled_reason})"
+    reset = f"resets in {_fmt_seconds(bucket.remaining_seconds_now)}" if bucket.reset_at > 0 else ""
     if bucket.limit > 0:
         line = _bucket_line(label, bucket, label_width)
+    elif bucket.utilization is not None:
+        pct = bucket.usage_pct
+        line = f"  {label:<{label_width}} {_bar(pct)} {pct:5.1f}%" + (f"  ({reset})" if reset else "")
     else:
-        reset = f"resets in {_fmt_seconds(bucket.remaining_seconds_now)}" if bucket.reset_at > 0 else "no limit reported"
-        line = f"  {label:<{label_width}}  ({reset})"
+        line = f"  {label:<{label_width}}  ({reset or 'no limit reported'})"
     return f"{line}  [{bucket.status}]" if bucket.status else line
+
+
+def _unified_compact_value(bucket: RateLimitBucket) -> str:
+    if bucket.limit > 0:
+        return f"{_fmt_count(bucket.remaining)}/{_fmt_count(bucket.limit)}"
+    if bucket.utilization is not None:
+        return f"{bucket.usage_pct:.0f}% used"
+    return bucket.status
 
 
 def format_rate_limit_display(state: RateLimitState) -> str:
@@ -303,11 +342,12 @@ def format_rate_limit_compact(state: RateLimitState) -> str:
     ]
     # Anthropic subscription windows: the reset is an absolute instant, so it always shows.
     # A window that reports only a status (no counters) still gets an entry — it is the whole
-    # signal that response carried.
+    # signal that response carried. A window the provider has switched off is left out: its
+    # ``rejected`` status is not a limit being hit.
     parts += [
-        f"{_unified_label(window)}: "
-        + (f"{_fmt_count(b.remaining)}/{_fmt_count(b.limit)}" if b.limit > 0 else b.status)
+        f"{_unified_label(window)}: {_unified_compact_value(b)}"
         + (f" (resets {_fmt_seconds(b.remaining_seconds_now)})" if b.reset_at > 0 else "")
-        for window, b in _sorted_unified(state) if b.limit > 0 or b.status
+        for window, b in _sorted_unified(state)
+        if not b.disabled_reason and (b.limit > 0 or b.utilization is not None or b.status)
     ]
     return " | ".join(parts)
